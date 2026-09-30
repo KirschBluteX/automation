@@ -9,7 +9,6 @@ Neither endpoint writes.
 import asyncio
 import fnmatch
 import logging
-import re
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -217,7 +216,8 @@ async def validate_draft(
 
     An invalid draft is still a successful validation: the response is 200 with
     `valid` false and one error per problem, each addressed to the field that
-    caused it. Only a malformed request envelope is a 4xx.
+    caused it. Unsupported checks return 501 only after other checks succeed;
+    dependency failures return 503. Only a malformed request envelope is a 4xx.
     """
     logger.info(
         "Validating draft for %s (automation_id=%s)", body.endpoint, body.automation_id
@@ -330,6 +330,19 @@ async def _validated_draft_response(
                 request=request,
                 client=client,
             )
+        )
+
+    # Complete every check before selecting the existing advisory response.
+    # An unsupported ref must not mask a missing credential, a denied repo, or
+    # an invalid trigger. Dependency failures have already propagated as 503.
+    unsupported_refs = [
+        error for error in errors if error.code == "repository_ref_unverified"
+    ]
+    errors = [error for error in errors if error.code != "repository_ref_unverified"]
+    if unsupported_refs and not errors:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=unsupported_refs[0].message,
         )
 
     return ValidateDraftResponse(
@@ -943,10 +956,15 @@ async def _local_repository_errors(
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
-    """Probe with the exact secret name the SDK will use when cloning this repo."""
-    # MCP credentials need not belong to the Git provider. Using one here can
-    # produce a false pass for a clone that only reads the canonical SDK secret.
+    """Use the same secret store and name as the local preset's clone path.
+
+    RemoteWorkspace.clone_repos() calls _get_secret_value() with the canonical
+    provider name. That reads /api/settings/secrets/{name}, backed by the same
+    FileSecretsStore as the metadata list and the repository probe. The clone
+    path does not read OPENHANDS_*_TOKEN environment variables or MCP aliases.
+    """
     canonical_name = PROVIDER_TOKEN_NAMES[GitProvider(provider)]
+    # Missing clone credentials still allow an anonymous check for public repos.
     candidate_names = (
         [canonical_name] if canonical_name in available_secret_names else []
     )
@@ -1082,16 +1100,16 @@ async def _cloud_ref_errors(
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
-    """Verify branches and their tip SHAs using the available Cloud contract.
+    """Prove exact branch names; report other refs as unsupported, not invalid.
 
-    Cloud has no tag/arbitrary-commit lookup here. A search miss is inconclusive,
-    not proof of denied access; do not silently approve an unchecked ref.
+    Cloud has no tag/arbitrary-commit lookup here. A SHA-prefix match cannot
+    disambiguate a hex-named tag or branch, so it is not evidence of validity.
+    A completed search miss becomes advisory after all blocking checks finish.
     """
 
     ref_matches = False
     page_id: str | None = None
     seen_page_ids: set[str] = set()
-    is_commit_sha = re.fullmatch(r"[0-9a-fA-F]{7,40}", ref) is not None
     for _ in range(_MAX_PREFLIGHT_SEARCH_PAGES):
         params: dict[str, str | int] = {
             "provider": provider,
@@ -1121,13 +1139,7 @@ async def _cloud_ref_errors(
             raise _DependencyUnavailable
         data = _json_object(response)
         names = _string_items(data, "items", "name")
-        commits = _string_items(data, "items", "commit_sha")
-        for name, commit_sha in zip(names, commits, strict=True):
-            if name == ref or (
-                is_commit_sha and commit_sha.casefold().startswith(ref.casefold())
-            ):
-                ref_matches = True
-                break
+        ref_matches = ref in names
         if ref_matches:
             break
         next_page_id = _next_page_id(data, seen_page_ids)
@@ -1143,9 +1155,8 @@ async def _cloud_ref_errors(
             field=f"repos[{index}].ref",
             code="repository_ref_unverified",
             message=(
-                "This deployment could not verify the Git reference. "
-                "Branch search cannot verify tags or arbitrary commits; "
-                "select an accessible branch or omit the reference."
+                "This deployment cannot verify tags or arbitrary commits. "
+                "Review the pinned Git reference before creating the automation."
             ),
         )
     ]

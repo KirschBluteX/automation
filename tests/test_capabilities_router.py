@@ -14,6 +14,7 @@ from openhands.automation.app import app
 from openhands.automation.auth import AuthMethod, authenticate_request
 from openhands.automation.config import clear_config_cache
 from openhands.automation.models import Base, CustomWebhook
+from openhands.sdk.workspace import RemoteWorkspace, repo as sdk_repo
 
 
 # Test UUID matching mock_authenticated_user fixture
@@ -996,11 +997,10 @@ class TestValidateDraft:
         ]
 
     @pytest.mark.parametrize(
-        ("repository_items", "branch_items", "expected_error"),
+        ("repository_items", "expected_error"),
         [
             pytest.param(
                 [],
-                None,
                 ("repos[0].url", "repository_not_accessible"),
                 id="repository",
             ),
@@ -1013,9 +1013,8 @@ class TestValidateDraft:
                         "is_public": False,
                     }
                 ],
-                [],
-                ("repos[0].ref", "repository_ref_unverified"),
-                id="ref",
+                ("repos[0].url", "repository_provider_not_connected"),
+                id="provider-disconnected-during-ref-check",
             ),
         ],
     )
@@ -1023,10 +1022,9 @@ class TestValidateDraft:
         self,
         async_client,
         repository_items,
-        branch_items,
         expected_error,
     ):
-        """Repository and ref failures identify the exact form field to fix."""
+        """Repository access failures identify the exact form field to fix."""
 
         def outbound(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/v1/git/repositories/search":
@@ -1035,11 +1033,7 @@ class TestValidateDraft:
                     json={"items": repository_items, "next_page_id": None},
                 )
             if request.url.path == "/api/v1/git/branches/search":
-                assert branch_items is not None
-                return httpx.Response(
-                    200,
-                    json={"items": branch_items, "next_page_id": None},
-                )
+                return httpx.Response(403)
             raise AssertionError(f"Unexpected outbound request: {request.url}")
 
         await install_outbound_transport(outbound)
@@ -1052,7 +1046,7 @@ class TestValidateDraft:
         assert addressed_errors(response.json()) == [expected_error]
 
     @pytest.mark.parametrize("ref", ["v1.0.0", "a" * 40, "missing-branch"])
-    async def test_branch_search_miss_does_not_claim_ref_is_missing(
+    async def test_unverified_cloud_ref_uses_unsupported_advisory(
         self, async_client, ref
     ):
         def outbound(request: httpx.Request) -> httpx.Response:
@@ -1073,12 +1067,255 @@ class TestValidateDraft:
             ),
         )
 
-        assert response.status_code == 200
-        assert addressed_errors(response.json()) == [
-            ("repos[0].ref", "repository_ref_unverified")
+        # Canvas already treats 501 as advisory, not a passed validation. Do not
+        # require users to discard a valid tag/commit pin to create an automation.
+        assert response.status_code == 501
+        assert "tag" in response.json()["detail"]
+        assert "commit" in response.json()["detail"]
+        assert "valid" not in response.json()
+
+    @pytest.mark.parametrize("unverified_first", [True, False])
+    async def test_unverified_ref_does_not_hide_another_repository_error(
+        self, async_client, unverified_first
+    ):
+        """An unsupported ref check cannot turn a denied repository into advisory."""
+        repos = [
+            {"url": "owner/allowed", "provider": "github", "ref": "v1.0.0"},
+            {"url": "owner/denied", "provider": "github"},
         ]
-        assert "tag" in response.json()["errors"][0]["message"]
-        assert "commit" in response.json()["errors"][0]["message"]
+        if not unverified_first:
+            repos.reverse()
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/repositories/search"):
+                allowed = request.url.params["query"] == "owner/allowed"
+                return httpx.Response(
+                    200,
+                    json={"items": [{"full_name": "owner/allowed"}] if allowed else []},
+                )
+            assert request.url.path.endswith("/branches/search")
+            return httpx.Response(200, json={"items": []})
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": repos}, requirements={"integrations": []}
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+        denied_index = 1 if unverified_first else 0
+        assert addressed_errors(response.json()) == [
+            (f"repos[{denied_index}].url", "repository_not_accessible")
+        ]
+
+    async def test_unverified_ref_does_not_hide_trigger_or_credential_errors(
+        self, async_client
+    ):
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/repositories/search"):
+                return httpx.Response(
+                    200, json={"items": [{"full_name": "OpenHands/agent-server-gui"}]}
+                )
+            if request.url.path == "/api/v1/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_settings": {
+                            "mcp_config": {
+                                "example": {"url": "https://mcp.example.test"}
+                            }
+                        }
+                    },
+                )
+            assert request.url.path in {
+                "/api/v1/secrets/search",
+                "/api/v1/git/branches/search",
+            }
+            return httpx.Response(200, json={"items": []})
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                with_trigger(CRON_DRAFT, schedule="*/10 * * * * *"),
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example",
+                            transport="shttp",
+                            locator="https://mcp.example.test",
+                            secret_names=["TOKEN"],
+                        )
+                    ]
+                },
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is False
+        assert addressed_errors(response.json()) == [
+            ("trigger.schedule", "interval_too_short"),
+            (None, "credential_missing"),
+        ]
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            404,
+            501,
+            429,
+            500,
+            "transport",
+            "non_json",
+            "malformed",
+            "repeated",
+            "truncated",
+        ],
+    )
+    async def test_branch_dependency_failure_is_not_an_unsupported_ref(
+        self, async_client, failure
+    ):
+        """Only a completed branch search permits advisory; outages still block."""
+        calls = 0
+        sentinel = "private-provider-body-and-token"
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            if request.url.path.endswith("/repositories/search"):
+                return httpx.Response(
+                    200, json={"items": [{"full_name": "OpenHands/agent-server-gui"}]}
+                )
+            assert request.url.path.endswith("/branches/search")
+            calls += 1
+            if isinstance(failure, int):
+                return httpx.Response(failure, text=sentinel)
+            if failure == "transport":
+                raise httpx.ReadTimeout(sentinel, request=request)
+            if failure == "non_json":
+                return httpx.Response(200, text=sentinel)
+            if failure == "malformed":
+                return httpx.Response(200, json={"items": [{"name": [sentinel]}]})
+            return httpx.Response(
+                200,
+                json={
+                    "items": [],
+                    "next_page_id": "same" if failure == "repeated" else str(calls),
+                },
+            )
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(CRON_DRAFT, requirements={"integrations": []}),
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Preflight validation is temporarily unavailable."
+        }
+        assert sentinel not in response.text
+        assert calls <= capabilities_router._MAX_PREFLIGHT_SEARCH_PAGES
+
+    @pytest.mark.parametrize("provider", ["github", "gitlab", "bitbucket"])
+    @pytest.mark.parametrize("canonical_present", [True, False])
+    @pytest.mark.parametrize("public", [True, False])
+    async def test_local_repository_credentials_match_real_sdk_clone_lookup(
+        self,
+        async_client,
+        monkeypatch,
+        tmp_path,
+        caplog,
+        provider,
+        canonical_present,
+        public,
+    ):
+        """The pinned SDK reads canonical secrets, not environment/MCP aliases."""
+        host = "http://agent-server.test"
+        monkeypatch.setenv("AUTOMATION_AGENT_SERVER_URL", host)
+        monkeypatch.setenv("AUTOMATION_AGENT_SERVER_API_KEY", "session-key")
+        monkeypatch.setenv(
+            f"OPENHANDS_{provider.upper()}_TOKEN", "environment-token-sentinel"
+        )
+        clear_config_cache()
+        canonical_name = sdk_repo.PROVIDER_TOKEN_NAMES[sdk_repo.GitProvider(provider)]
+        token = "canonical-token-sentinel"
+        # An integration's custom secret and the exported spelling must not
+        # substitute for the provider credential RemoteWorkspace actually reads.
+        stored = {
+            f"{provider.upper()}_TOKEN": "mcp-token-sentinel",
+            f"OPENHANDS_{provider.upper()}_TOKEN": "exported-token-sentinel",
+        }
+        if canonical_present:
+            stored[canonical_name] = token
+        repo = {"url": "owner/repo", "provider": provider}
+        expected_token = token if canonical_present else None
+        clone_tokens: list[str | None] = []
+
+        def clone(_repo, _destination, credential):
+            clone_tokens.append(credential)
+            return public or credential == token
+
+        def sdk_transport(request: httpx.Request) -> httpx.Response:
+            assert request.headers["x-session-api-key"] == "session-key"
+            assert request.url.path == f"/api/settings/secrets/{canonical_name}"
+            return (
+                httpx.Response(200, text=token)
+                if canonical_present
+                else httpx.Response(404)
+            )
+
+        monkeypatch.setattr(sdk_repo, "_clone_single_repo", clone)
+        workspace = RemoteWorkspace(
+            host=host, api_key="session-key", working_dir=str(tmp_path)
+        )
+        with httpx.Client(
+            base_url=host, transport=httpx.MockTransport(sdk_transport)
+        ) as client:
+            workspace._client = client
+            clone_result = workspace.clone_repos([repo])
+        assert clone_tokens == [expected_token]
+        assert clone_result.success_count == int(public or canonical_present)
+
+        def preflight_transport(request: httpx.Request) -> httpx.Response:
+            assert request.headers["x-session-api-key"] == "session-key"
+            if request.url.path == "/api/settings/secrets":
+                return httpx.Response(
+                    200, json={"secrets": [{"name": name} for name in stored]}
+                )
+            # Preflight never reads the per-secret value endpoint used by clone.
+            assert request.url.path == "/api/git/validate-repository"
+            payload = json.loads(request.content)
+            names = payload["credential_names"]
+            assert names == ([canonical_name] if canonical_present else [])
+            credential = next(
+                (stored[name] for name in names if stored.get(name)), None
+            )
+            assert credential == expected_token
+            return httpx.Response(
+                200,
+                json={
+                    "status": "accessible"
+                    if public or credential == token
+                    else "not_found"
+                },
+            )
+
+        await install_outbound_transport(preflight_transport)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": [repo]}, requirements={"integrations": []}
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is bool(clone_result.success_count)
+        for secret in [*stored.values(), "environment-token-sentinel"]:
+            assert secret not in response.text
+            assert secret not in caplog.text
 
     async def test_local_preflight_uses_names_and_encrypted_mcp_configuration(
         self, async_client, monkeypatch
@@ -1392,9 +1629,11 @@ class TestValidateDraft:
         assert "/api/v1/git/branches/search" in calls
         assert ("/api/v1/settings/mcp/example/test" in calls) is credential_exists
 
-    @pytest.mark.parametrize("ref", ["a", "abcdef"])
-    async def test_short_hex_branch_name_is_not_a_commit_sha(self, async_client, ref):
-        """A missing branch cannot pass merely because a SHA starts with its name."""
+    @pytest.mark.parametrize("ref", ["a", "abcdef", "abcdef0", "abcdef" + "0" * 34])
+    async def test_hex_ref_does_not_pass_from_a_branch_tip_prefix(
+        self, async_client, ref
+    ):
+        """A SHA prefix cannot distinguish a hex ref naming a tag from a commit."""
 
         def outbound(request: httpx.Request) -> httpx.Response:
             if request.url.path.endswith("/repositories/search"):
@@ -1414,10 +1653,33 @@ class TestValidateDraft:
                 requirements={"integrations": []},
             ),
         )
+        assert response.status_code == 501
+
+    @pytest.mark.parametrize("ref", [None, "main", "abcdef0"])
+    async def test_cloud_default_and_exact_branch_names_pass(self, async_client, ref):
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/repositories/search"):
+                return httpx.Response(
+                    200, json={"items": [{"full_name": "OpenHands/agent-server-gui"}]}
+                )
+            assert ref is not None
+            assert request.url.path.endswith("/branches/search")
+            return httpx.Response(
+                200, json={"items": [{"name": ref, "commit_sha": "b" * 40}]}
+            )
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": [{**CRON_DRAFT["repos"][0], "ref": ref}]},
+                requirements={"integrations": []},
+            ),
+        )
+
         assert response.status_code == 200
-        assert addressed_errors(response.json()) == [
-            ("repos[0].ref", "repository_ref_unverified")
-        ]
+        assert response.json()["valid"] is True
+        assert response.json()["errors"] == []
 
     @pytest.mark.parametrize(
         "locator",
