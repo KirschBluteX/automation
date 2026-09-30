@@ -1210,9 +1210,13 @@ PreflightIntegrationAuthStrategy = Literal[
     "none", "api_key", "bearer", "basic", "oauth2"
 ]
 
-_PREFLIGHT_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
-_PREFLIGHT_SECRET_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
-_MAX_PREFLIGHT_SECRET_REFERENCES = 32
+_PREFLIGHT_IDENTIFIER_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+)
+_PREFLIGHT_SECRET_NAME_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_]{0,63}$"
+)
+_MAX_PREFLIGHT_SECRET_REFERENCES: Final[int] = 32
 
 
 class PreflightIntegrationAlternative(_SetupContractModel):
@@ -1248,12 +1252,17 @@ class PreflightIntegrationAlternative(_SetupContractModel):
                 raise ValueError("stdio locator must be a valid MCP server name")
             return self
 
-        parsed = urlparse(self.locator)
+        try:
+            parsed = urlparse(self.locator)
+            port = parsed.port
+        except ValueError:
+            raise ValueError("remote locator must be a valid HTTP(S) URL") from None
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
+            or port == 0
         ):
             raise ValueError(
                 "remote locator must be an HTTP(S) URL without credentials"

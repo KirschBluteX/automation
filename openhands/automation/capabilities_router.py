@@ -9,9 +9,12 @@ Neither endpoint writes.
 import asyncio
 import fnmatch
 import logging
+import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from functools import partial
+from typing import Any, Final, Literal
 from urllib.parse import quote, urlparse
 from zoneinfo import available_timezones
 
@@ -24,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from openhands.automation.auth import (
     MAX_SESSION_COOKIE_CHUNKS,
     SESSION_COOKIE_NAME,
+    X_ORG_ID_HEADER,
     AuthenticatedUser,
     AuthMethod,
     get_http_client,
@@ -67,6 +71,7 @@ from openhands.automation.utils.model_profiles import (
 )
 from openhands.automation.utils.webhook import get_webhook_config
 from openhands.sdk.settings import OpenHandsAgentSettings
+from openhands.sdk.workspace.repo import PROVIDER_TOKEN_NAMES, GitProvider, RepoSource
 
 
 logger = logging.getLogger(__name__)
@@ -77,7 +82,7 @@ _require_view_automations = require_permission("view_automations")
 
 # Features every deployment has: they come from the SDK code the service
 # packages into a run, not from configuration.
-_STATIC_FEATURES = (
+_STATIC_FEATURES: Final[tuple[str, ...]] = (
     "automationDrafts",
     "conversationDispatch",
     # Can run a client-supplied tarball, so an entry may ship a script bundle.
@@ -89,22 +94,22 @@ _STATIC_FEATURES = (
 )
 
 # Tags Pydantic inserts into an error location for the trigger union.
-_TRIGGER_TAGS = frozenset({"cron", "event"})
+_TRIGGER_TAGS: Final[frozenset[str]] = frozenset({"cron", "event"})
 
-_MCP_PROBE_TIMEOUT_SECONDS = 15.0
-_MCP_PROBE_REQUEST_TIMEOUT_SECONDS = _MCP_PROBE_TIMEOUT_SECONDS + 5.0
-_PREFLIGHT_TOTAL_TIMEOUT_SECONDS = 60.0
-_MAX_PREFLIGHT_SEARCH_PAGES = 10
+# Leave time for the server to return its verdict after its own probe deadline.
+_MCP_PROBE_TIMEOUT_SECONDS: Final[float] = 15.0
+_MCP_PROBE_REQUEST_TIMEOUT_SECONDS: Final[float] = _MCP_PROBE_TIMEOUT_SECONDS + 5.0
+_PREFLIGHT_TOTAL_TIMEOUT_SECONDS: Final[float] = 60.0
+_MAX_PREFLIGHT_SEARCH_PAGES: Final[int] = 10
+_PREFLIGHT_CONCURRENCY: Final[int] = 4
+_MAX_PREFLIGHT_REPOSITORIES: Final[int] = 32
 # The Cloud git route requests one look-ahead item from providers to decide
 # whether to return ``next_page_id``. Keeping this below provider max 100 lets
 # that look-ahead survive instead of being clamped away.
-_CLOUD_REPOSITORY_SEARCH_PAGE_SIZE = 99
-_LOCAL_REPOSITORY_SECRET_NAMES = {
-    "github": "github_token",
-    "gitlab": "gitlab_token",
-    "bitbucket": "bitbucket_token",
-}
-_REPOSITORY_PROVIDER_HOSTS = {
+_CLOUD_REPOSITORY_SEARCH_PAGE_SIZE: Final[int] = 99
+# The Cloud API targets these public hosts. An explicit provider must not make
+# a self-hosted or lookalike URL pass by checking the same path on a public host.
+_REPOSITORY_PROVIDER_HOSTS: Final[dict[str, str]] = {
     "github": "github.com",
     "gitlab": "gitlab.com",
     "bitbucket": "bitbucket.org",
@@ -112,18 +117,26 @@ _REPOSITORY_PROVIDER_HOSTS = {
 
 
 class _DependencyUnavailable(Exception):
-    """A trusted validation dependency did not return a usable answer."""
+    """Internal control flow for an inconclusive check, translated to a safe 503.
+
+    Keep this private: callers consume HTTP verdicts, never dependency exceptions.
+    The exception deliberately carries no upstream body, URL, or credentials.
+    """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _PreflightTarget:
+    """Trusted service URL and request-scoped authentication for all probes."""
+
     base_url: str
     headers: dict[str, str]
     local: bool
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _StoredMCPServer:
+    """Normalized matching metadata and the config used only by local probes."""
+
     name: str
     raw: dict[str, Any]
     transport: Literal["stdio", "shttp", "sse"]
@@ -231,7 +244,7 @@ async def validate_draft(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Preflight validation is temporarily unavailable.",
-        )
+        ) from None
 
 
 async def _validated_draft_response(
@@ -243,6 +256,7 @@ async def _validated_draft_response(
     session: AsyncSession,
     client: httpx.AsyncClient,
 ) -> ValidateDraftResponse:
+    """Collect draft errors; deployment checks are opt-in for legacy clients."""
     errors: list[DraftValidationError] = []
     sample_event_matched: bool | None = None
 
@@ -333,8 +347,24 @@ async def _deployment_preflight_errors(
     request: Request,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
+    """Load shared metadata once, then check independent requirements in parallel."""
     requirements = body.requirements
     if requirements is None:
+        return []
+
+    repos = [] if isinstance(draft, CreateAutomationRequest) else (draft.repos or [])
+    if len(repos) > _MAX_PREFLIGHT_REPOSITORIES:
+        return [
+            DraftValidationError(
+                field="repos",
+                code="too_many_repositories",
+                message=(
+                    "Validate at most "
+                    f"{_MAX_PREFLIGHT_REPOSITORIES} repositories at once."
+                ),
+            )
+        ]
+    if not requirements.integrations and not repos:
         return []
 
     target = _preflight_target(request, user)
@@ -344,22 +374,21 @@ async def _deployment_preflight_errors(
         for alternative in requirement.alternatives
         for name in alternative.secret_names
     }
-    repos = [] if isinstance(draft, CreateAutomationRequest) else draft.repos
     if target.local and repos:
-        requested_secret_names.update(_LOCAL_REPOSITORY_SECRET_NAMES.values())
+        requested_secret_names.update(PROVIDER_TOKEN_NAMES.values())
 
     available_secret_names = await _available_secret_names(
         target,
         requested_secret_names,
         client,
     )
-    errors: list[DraftValidationError] = []
-
+    checks: list[Callable[[], Awaitable[list[DraftValidationError]]]] = []
     if requirements.integrations:
         servers = await _stored_mcp_servers(target, client)
         for requirement in requirements.integrations:
-            errors.extend(
-                await _integration_errors(
+            checks.append(
+                partial(
+                    _integration_errors,
                     requirement,
                     servers,
                     available_secret_names,
@@ -368,37 +397,70 @@ async def _deployment_preflight_errors(
                 )
             )
 
-    if repos:
-        for index, repository in enumerate(repos):
-            errors.extend(
-                await _repository_errors(
-                    repository=repository,
-                    index=index,
-                    requirements=requirements.integrations,
-                    available_secret_names=available_secret_names,
-                    target=target,
-                    client=client,
-                )
+    for index, repository in enumerate(repos):
+        checks.append(
+            partial(
+                _repository_errors,
+                repository=repository,
+                index=index,
+                available_secret_names=available_secret_names,
+                target=target,
+                client=client,
             )
+        )
+    return await _run_preflight_checks(checks)
 
-    return errors
+
+async def _run_preflight_checks(
+    checks: list[Callable[[], Awaitable[list[DraftValidationError]]]],
+) -> list[DraftValidationError]:
+    """Limit outbound work and retain field order, even when responses race.
+
+    Gather alone leaves siblings running after a failure. Always cancel and
+    drain them before returning, including when the request deadline expires.
+    Factories keep queued checks from creating unawaited coroutines on cancel.
+    """
+    limit = asyncio.Semaphore(_PREFLIGHT_CONCURRENCY)
+
+    async def run(
+        check: Callable[[], Awaitable[list[DraftValidationError]]],
+    ) -> list[DraftValidationError]:
+        async with limit:
+            return await check()
+
+    tasks = [asyncio.create_task(run(check)) for check in checks]
+    try:
+        results = await asyncio.gather(*tasks)
+        return [error for errors in results for error in errors]
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _preflight_target(request: Request, user: AuthenticatedUser) -> _PreflightTarget:
+    """Probe under the same effective identity and organization as creation."""
     settings = get_config().service
     if settings.is_local_mode:
-        headers = {}
-        if settings.agent_server_api_key:
-            headers["X-Session-API-Key"] = settings.agent_server_api_key
         return _PreflightTarget(
             base_url=settings.agent_server_url.rstrip("/"),
-            headers=headers,
+            headers=(
+                {"X-Session-API-Key": settings.agent_server_api_key}
+                if settings.agent_server_api_key
+                else {}
+            ),
             local=True,
         )
 
+    # Authentication already resolved API-key scope > selected org > current org.
+    # Reuse that identity instead of allowing a later Cloud read to choose another.
+    headers = {X_ORG_ID_HEADER: str(user.org_id)}
     if user.auth_method == AuthMethod.API_KEY and user.api_key:
-        headers = {"Authorization": f"Bearer {user.api_key}"}
-    elif user.auth_method == AuthMethod.COOKIE:
+        headers["Authorization"] = f"Bearer {user.api_key}"
+        return _PreflightTarget(
+            settings.openhands_api_base_url.rstrip("/"), headers, False
+        )
+    if user.auth_method == AuthMethod.COOKIE:
         cookies: list[str] = []
         for index in range(MAX_SESSION_COOKIE_CHUNKS):
             name = (
@@ -410,15 +472,11 @@ def _preflight_target(request: Request, user: AuthenticatedUser) -> _PreflightTa
             cookies.append(f"{name}={value}")
         if not cookies:
             raise _DependencyUnavailable
-        headers = {"Cookie": "; ".join(cookies)}
-    else:
-        raise _DependencyUnavailable
-
-    return _PreflightTarget(
-        base_url=settings.openhands_api_base_url.rstrip("/"),
-        headers=headers,
-        local=False,
-    )
+        headers["Cookie"] = "; ".join(cookies)
+        return _PreflightTarget(
+            settings.openhands_api_base_url.rstrip("/"), headers, False
+        )
+    raise _DependencyUnavailable
 
 
 async def _send_preflight_request(
@@ -429,18 +487,23 @@ async def _send_preflight_request(
     headers: dict[str, str],
     **kwargs: Any,
 ) -> httpx.Response:
+    """Separate inconclusive dependency failures from actionable validation errors."""
     try:
         response = await client.request(method, url, headers=headers, **kwargs)
     except httpx.RequestError:
+        # HTTP exceptions may retain credential-bearing URLs or provider details.
+        # Suppress their chain at this boundary as well as the public response.
         raise _DependencyUnavailable from None
-    if response.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-        raise _DependencyUnavailable
-    if response.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+    if (
+        response.status_code == status.HTTP_429_TOO_MANY_REQUESTS
+        or response.status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR
+    ):
         raise _DependencyUnavailable
     return response
 
 
 def _json_object(response: httpx.Response) -> dict[str, Any]:
+    """Reject HTML proxy errors and incompatible JSON without exposing their bodies."""
     try:
         value = response.json()
     except ValueError:
@@ -455,6 +518,7 @@ async def _available_secret_names(
     requested_names: set[str],
     client: httpx.AsyncClient,
 ) -> set[str]:
+    """Read secret metadata only; a search match must equal the requested name."""
     if not requested_names:
         return set()
 
@@ -467,68 +531,77 @@ async def _available_secret_names(
         )
         if response.status_code != status.HTTP_200_OK:
             raise _DependencyUnavailable
-        items = _json_object(response).get("secrets")
-        if not isinstance(items, list):
-            raise _DependencyUnavailable
-        names: set[str] = set()
-        for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                raise _DependencyUnavailable
-            names.add(item["name"])
+        names = set(_string_items(_json_object(response), "secrets", "name"))
         return names.intersection(requested_names)
 
     found: set[str] = set()
     for name in sorted(requested_names):
-        page_id: str | None = None
-        seen_page_ids: set[str] = set()
-        for _ in range(_MAX_PREFLIGHT_SEARCH_PAGES):
-            params: dict[str, str | int] = {
-                "name__contains": name,
-                "limit": 100,
-            }
-            if page_id is not None:
-                params["page_id"] = page_id
-            response = await _send_preflight_request(
-                client,
-                "GET",
-                f"{target.base_url}/api/v1/secrets/search",
-                headers=target.headers,
-                params=params,
-            )
-            if response.status_code != status.HTTP_200_OK:
-                raise _DependencyUnavailable
-            data = _json_object(response)
-            items = data.get("items")
-            if not isinstance(items, list):
-                raise _DependencyUnavailable
-            item_names: list[str] = []
-            for item in items:
-                if not isinstance(item, dict) or not isinstance(item.get("name"), str):
-                    raise _DependencyUnavailable
-                item_names.append(item["name"])
-            if name in item_names:
-                found.add(name)
-                break
-            next_page_id = data.get("next_page_id")
-            if next_page_id is None:
-                break
-            if (
-                not isinstance(next_page_id, str)
-                or not next_page_id
-                or next_page_id in seen_page_ids
-            ):
-                raise _DependencyUnavailable
-            seen_page_ids.add(next_page_id)
-            page_id = next_page_id
-        else:
-            raise _DependencyUnavailable
+        if await _cloud_secret_exists(target, name, client):
+            found.add(name)
     return found
+
+
+def _string_items(data: dict[str, Any], collection: str, field: str) -> list[str]:
+    """Validate the metadata we consume; upstream JSON is not a typed model.
+
+    A missing or malformed collection is not evidence that a credential or repo
+    is absent. Treat an incompatible response as unavailable, not an empty list.
+    """
+    items = data.get(collection)
+    if not isinstance(items, list):
+        raise _DependencyUnavailable
+    values: list[str] = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get(field), str):
+            raise _DependencyUnavailable
+        values.append(item[field])
+    return values
+
+
+def _next_page_id(data: dict[str, Any], seen: set[str]) -> str | None:
+    """Accept a fresh cursor or normal end-of-results; reject broken pagination."""
+    page_id = data.get("next_page_id")
+    if page_id is None:
+        return None
+    if not isinstance(page_id, str) or not page_id or page_id in seen:
+        raise _DependencyUnavailable
+    seen.add(page_id)
+    return page_id
+
+
+async def _cloud_secret_exists(
+    target: _PreflightTarget, name: str, client: httpx.AsyncClient
+) -> bool:
+    """Resolve an exact secret name through Cloud's paginated substring search."""
+    params: dict[str, str | int] = {"name__contains": name, "limit": 100}
+    seen: set[str] = set()
+    for _ in range(_MAX_PREFLIGHT_SEARCH_PAGES):
+        response = await _send_preflight_request(
+            client,
+            "GET",
+            f"{target.base_url}/api/v1/secrets/search",
+            headers=target.headers,
+            params=params,
+        )
+        if response.status_code != status.HTTP_200_OK:
+            raise _DependencyUnavailable
+        data = _json_object(response)
+        if name in _string_items(data, "items", "name"):
+            return True
+        page_id = _next_page_id(data, seen)
+        if page_id is None:
+            return False
+        params["page_id"] = page_id
+    # A truncated search cannot prove absence. Do not ask the user to replace
+    # a credential that may simply be beyond the service's bounded search.
+    raise _DependencyUnavailable
 
 
 async def _stored_mcp_servers(
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[_StoredMCPServer]:
+    """Load stored servers, isolating invalid entries from unrelated integrations."""
     headers = dict(target.headers)
     path = "/api/settings" if target.local else "/api/v1/settings"
     if target.local:
@@ -562,6 +635,7 @@ async def _stored_mcp_servers(
 
 
 def _parse_stored_mcp_server(name: str, raw: dict[str, Any]) -> _StoredMCPServer:
+    """Use the SDK's auth migration so old saved settings still match the catalog."""
     enabled = raw.get("enabled", True)
     if not isinstance(enabled, bool):
         raise _DependencyUnavailable
@@ -571,17 +645,16 @@ def _parse_stored_mcp_server(name: str, raw: dict[str, Any]) -> _StoredMCPServer
         raw_transport = "stdio" if isinstance(raw.get("command"), str) else "http"
     if not isinstance(raw_transport, str):
         raise _DependencyUnavailable
-    if raw_transport == "stdio":
-        transport: Literal["stdio", "shttp", "sse"] = "stdio"
-        locator = name
-    elif raw_transport in {"http", "streamable-http", "shttp"}:
-        transport = "shttp"
-        locator = raw.get("url")
-    elif raw_transport == "sse":
-        transport = "sse"
-        locator = raw.get("url")
-    else:
-        raise _DependencyUnavailable
+    transport: Literal["stdio", "shttp", "sse"]
+    match raw_transport:
+        case "stdio":
+            transport, locator = "stdio", name
+        case "http" | "streamable-http" | "shttp":
+            transport, locator = "shttp", raw.get("url")
+        case "sse":
+            transport, locator = "sse", raw.get("url")
+        case _:
+            raise _DependencyUnavailable
     if not isinstance(locator, str) or not locator:
         raise _DependencyUnavailable
 
@@ -594,6 +667,8 @@ def _parse_stored_mcp_server(name: str, raw: dict[str, Any]) -> _StoredMCPServer
     auth_strategy = server.auth.strategy if server.auth is not None else "none"
     return _StoredMCPServer(
         name=name,
+        # Local settings were fetched with encrypted exposure. Preserve those
+        # opaque values for agent-server to decrypt, never return them to the UI.
         raw=server.model_dump(
             mode="json",
             exclude_none=True,
@@ -607,13 +682,22 @@ def _parse_stored_mcp_server(name: str, raw: dict[str, Any]) -> _StoredMCPServer
     )
 
 
-def _normalized_remote_locator(value: str) -> tuple[str, str, int | None, str] | None:
+def _normalized_remote_locator(
+    value: str,
+) -> tuple[str, str, int | None, str, str] | None:
+    """Normalize URL spelling without merging different query-selected tenants."""
     try:
         parsed = urlparse(value)
         port = parsed.port
     except ValueError:
         return None
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port == 0
+    ):
         return None
     if (parsed.scheme == "http" and port == 80) or (
         parsed.scheme == "https" and port == 443
@@ -624,6 +708,7 @@ def _normalized_remote_locator(value: str) -> tuple[str, str, int | None, str] |
         parsed.hostname.lower(),
         port,
         parsed.path.rstrip("/"),
+        parsed.query,
     )
 
 
@@ -631,20 +716,20 @@ def _alternative_matches_server(
     alternative: PreflightIntegrationAlternative,
     server: _StoredMCPServer,
 ) -> bool:
+    """Match the stored connection, not an arbitrary URL supplied for a probe."""
     if alternative.transport != server.transport:
         return False
-    if alternative.transport == "stdio":
-        if alternative.locator != server.locator:
-            return False
-    elif _normalized_remote_locator(alternative.locator) != _normalized_remote_locator(
-        server.locator
-    ):
+    if alternative.transport == "stdio" and alternative.locator != server.locator:
         return False
+    if alternative.transport != "stdio":
+        locator = _normalized_remote_locator(alternative.locator)
+        if locator is None or locator != _normalized_remote_locator(server.locator):
+            return False
 
     expected_auth = alternative.auth_strategy
-    if expected_auth is None:
-        return True
-    if server.auth_strategy == "header" and expected_auth == "none":
+    if expected_auth is None or (
+        server.auth_strategy == "header" and expected_auth == "none"
+    ):
         return True
     return server.auth_strategy == expected_auth
 
@@ -656,6 +741,11 @@ async def _integration_errors(
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
+    """Any usable alternative satisfies an integration; report missing prerequisites.
+
+    Try another matching server after a probe failure. If none succeeds and a
+    dependency failed, we cannot distinguish an outage from a bad connection.
+    """
     matches = [
         (alternative, server)
         for alternative in requirement.alternatives
@@ -733,6 +823,7 @@ async def _probe_mcp_server(
     server: _StoredMCPServer,
     client: httpx.AsyncClient,
 ) -> bool:
+    """Delegate connectivity to the service that owns the stored MCP credentials."""
     if target.local:
         path = "/api/mcp/test"
         payload = {
@@ -759,7 +850,8 @@ async def _probe_mcp_server(
     return ok
 
 
-def _repository_parts(repository: Any) -> tuple[str, str] | None:
+def _repository_parts(repository: RepoSource) -> tuple[str, str] | None:
+    """Accept public-provider identifiers without forwarding URL credentials."""
     try:
         provider = repository.get_provider().value
     except ValueError:
@@ -804,13 +896,13 @@ def _repository_parts(repository: Any) -> tuple[str, str] | None:
 
 async def _repository_errors(
     *,
-    repository: Any,
+    repository: RepoSource,
     index: int,
-    requirements: list[PreflightIntegrationRequirement],
     available_secret_names: set[str],
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
+    """Select the credential-owning service and preserve the draft's field index."""
     parts = _repository_parts(repository)
     if parts is None:
         return [
@@ -825,9 +917,8 @@ async def _repository_errors(
         return await _local_repository_errors(
             provider=provider,
             identifier=identifier,
-            ref=repository.ref,
+            ref=repository.ref or None,
             index=index,
-            requirements=requirements,
             available_secret_names=available_secret_names,
             target=target,
             client=client,
@@ -835,7 +926,7 @@ async def _repository_errors(
     return await _cloud_repository_errors(
         provider=provider,
         identifier=identifier,
-        ref=repository.ref,
+        ref=repository.ref or None,
         index=index,
         target=target,
         client=client,
@@ -848,25 +939,17 @@ async def _local_repository_errors(
     identifier: str,
     ref: str | None,
     index: int,
-    requirements: list[PreflightIntegrationRequirement],
     available_secret_names: set[str],
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
-    candidate_names: list[str] = []
-    for requirement in requirements:
-        if requirement.id != provider:
-            continue
-        for alternative in requirement.alternatives:
-            for name in alternative.secret_names:
-                if name in available_secret_names and name not in candidate_names:
-                    candidate_names.append(name)
-    canonical_name = _LOCAL_REPOSITORY_SECRET_NAMES[provider]
-    if (
-        canonical_name in available_secret_names
-        and canonical_name not in candidate_names
-    ):
-        candidate_names.append(canonical_name)
+    """Probe with the exact secret name the SDK will use when cloning this repo."""
+    # MCP credentials need not belong to the Git provider. Using one here can
+    # produce a false pass for a clone that only reads the canonical SDK secret.
+    canonical_name = PROVIDER_TOKEN_NAMES[GitProvider(provider)]
+    candidate_names = (
+        [canonical_name] if canonical_name in available_secret_names else []
+    )
 
     response = await _send_preflight_request(
         client,
@@ -877,7 +960,7 @@ async def _local_repository_errors(
             "provider": provider,
             "repository": identifier,
             "ref": ref,
-            "credential_names": candidate_names[:5],
+            "credential_names": candidate_names,
         },
     )
     if response.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
@@ -929,6 +1012,7 @@ async def _cloud_repository_errors(
     target: _PreflightTarget,
     client: httpx.AsyncClient,
 ) -> list[DraftValidationError]:
+    """Check repository visibility using Cloud's provider credentials, not ours."""
     repository_found = False
     page_id: str | None = None
     seen_page_ids: set[str] = set()
@@ -958,27 +1042,13 @@ async def _cloud_repository_errors(
         if response.status_code != status.HTTP_200_OK:
             raise _DependencyUnavailable
         data = _json_object(response)
-        items = data.get("items")
-        if not isinstance(items, list):
-            raise _DependencyUnavailable
-        names: list[str] = []
-        for item in items:
-            if not isinstance(item, dict) or not isinstance(item.get("full_name"), str):
-                raise _DependencyUnavailable
-            names.append(item["full_name"])
+        names = _string_items(data, "items", "full_name")
         if identifier.casefold() in {name.casefold() for name in names}:
             repository_found = True
             break
-        next_page_id = data.get("next_page_id")
+        next_page_id = _next_page_id(data, seen_page_ids)
         if next_page_id is None:
             break
-        if (
-            not isinstance(next_page_id, str)
-            or not next_page_id
-            or next_page_id in seen_page_ids
-        ):
-            raise _DependencyUnavailable
-        seen_page_ids.add(next_page_id)
         page_id = next_page_id
     else:
         raise _DependencyUnavailable
@@ -993,16 +1063,42 @@ async def _cloud_repository_errors(
         ]
     if ref is None:
         return []
+    return await _cloud_ref_errors(
+        provider=provider,
+        identifier=identifier,
+        ref=ref,
+        index=index,
+        target=target,
+        client=client,
+    )
+
+
+async def _cloud_ref_errors(
+    *,
+    provider: str,
+    identifier: str,
+    ref: str,
+    index: int,
+    target: _PreflightTarget,
+    client: httpx.AsyncClient,
+) -> list[DraftValidationError]:
+    """Verify branches and their tip SHAs using the available Cloud contract.
+
+    Cloud has no tag/arbitrary-commit lookup here. A search miss is inconclusive,
+    not proof of denied access; do not silently approve an unchecked ref.
+    """
 
     ref_matches = False
-    page_id = None
-    seen_page_ids = set()
+    page_id: str | None = None
+    seen_page_ids: set[str] = set()
+    is_commit_sha = re.fullmatch(r"[0-9a-fA-F]{7,40}", ref) is not None
     for _ in range(_MAX_PREFLIGHT_SEARCH_PAGES):
-        params = {
+        params: dict[str, str | int] = {
             "provider": provider,
             "repository": identifier,
-            "query": ref,
-            "limit": 100,
+            # Cloud only paginates an empty query; a filtered second page is 400.
+            "query": "",
+            "limit": _CLOUD_REPOSITORY_SEARCH_PAGE_SIZE,
         }
         if page_id is not None:
             params["page_id"] = page_id
@@ -1024,31 +1120,19 @@ async def _cloud_repository_errors(
         if response.status_code != status.HTTP_200_OK:
             raise _DependencyUnavailable
         data = _json_object(response)
-        branch_items = data.get("items")
-        if not isinstance(branch_items, list):
-            raise _DependencyUnavailable
-        for item in branch_items:
-            if not isinstance(item, dict):
-                raise _DependencyUnavailable
-            name = item.get("name")
-            commit_sha = item.get("commit_sha")
-            if not isinstance(name, str) or not isinstance(commit_sha, str):
-                raise _DependencyUnavailable
-            if name == ref or commit_sha.casefold().startswith(ref.casefold()):
+        names = _string_items(data, "items", "name")
+        commits = _string_items(data, "items", "commit_sha")
+        for name, commit_sha in zip(names, commits, strict=True):
+            if name == ref or (
+                is_commit_sha and commit_sha.casefold().startswith(ref.casefold())
+            ):
                 ref_matches = True
                 break
         if ref_matches:
             break
-        next_page_id = data.get("next_page_id")
+        next_page_id = _next_page_id(data, seen_page_ids)
         if next_page_id is None:
             break
-        if (
-            not isinstance(next_page_id, str)
-            or not next_page_id
-            or next_page_id in seen_page_ids
-        ):
-            raise _DependencyUnavailable
-        seen_page_ids.add(next_page_id)
         page_id = next_page_id
     else:
         raise _DependencyUnavailable

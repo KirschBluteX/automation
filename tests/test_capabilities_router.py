@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from openhands.automation import capabilities_router
 from openhands.automation.app import app
-from openhands.automation.auth import authenticate_request
+from openhands.automation.auth import AuthMethod, authenticate_request
 from openhands.automation.config import clear_config_cache
 from openhands.automation.models import Base, CustomWebhook
 
@@ -803,7 +803,7 @@ class TestValidateDraft:
                 assert request.url.params["repository"] == (
                     "OpenHands/agent-server-gui"
                 )
-                assert request.url.params["query"] == "main"
+                assert request.url.params["query"] == ""
                 return httpx.Response(
                     200,
                     json={
@@ -879,6 +879,10 @@ class TestValidateDraft:
                     },
                 )
             if request.url.path == "/api/v1/git/branches/search":
+                # The real Cloud route rejects paged, non-empty branch queries.
+                if page_id is not None and request.url.params["query"]:
+                    return httpx.Response(400)
+                assert request.url.params["limit"] == "99"
                 if page_id is None:
                     return httpx.Response(
                         200,
@@ -1124,7 +1128,6 @@ class TestValidateDraft:
             if request.url.path == "/api/git/validate-repository":
                 payload = json.loads(request.content)
                 assert payload["credential_names"] == [
-                    "GITHUB_TOKEN",
                     "github_token",
                 ]
                 return httpx.Response(200, json={"status": "accessible"})
@@ -1153,7 +1156,19 @@ class TestValidateDraft:
         assert response.json()["valid"] is True
         assert encrypted not in response.text
 
-    @pytest.mark.parametrize("failure_kind", ["status", "transport"])
+    @pytest.mark.parametrize(
+        "failure_kind",
+        [
+            "status",
+            "transport",
+            "missing",
+            "unsupported",
+            "rate_limit",
+            "non_json",
+            "json_array",
+            "invalid_items",
+        ],
+    )
     async def test_dependency_failures_return_sanitized_503(
         self, async_client, failure_kind
     ):
@@ -1163,6 +1178,19 @@ class TestValidateDraft:
         def outbound(request: httpx.Request) -> httpx.Response:
             if failure_kind == "transport":
                 raise httpx.ConnectError(sentinel, request=request)
+            if failure_kind in {"missing", "unsupported", "rate_limit"}:
+                return httpx.Response(
+                    {"missing": 404, "unsupported": 501, "rate_limit": 429}[
+                        failure_kind
+                    ],
+                    text=sentinel,
+                )
+            if failure_kind == "non_json":
+                return httpx.Response(200, text=sentinel)
+            if failure_kind == "json_array":
+                return httpx.Response(200, json=[sentinel])
+            if failure_kind == "invalid_items":
+                return httpx.Response(200, json={"items": [{"full_name": None}]})
             return httpx.Response(500, text=sentinel)
 
         await install_outbound_transport(outbound)
@@ -1278,3 +1306,445 @@ class TestValidateDraft:
         )
 
         assert response.status_code == 422
+        assert "must-not-be-accepted" not in response.text
+
+    @pytest.mark.parametrize("auth_method", [AuthMethod.COOKIE, AuthMethod.API_KEY])
+    @pytest.mark.parametrize("credential_exists", [True, False])
+    async def test_preflight_uses_authenticated_org_for_every_cloud_request(
+        self, async_client, mock_authenticated_user, auth_method, credential_exists
+    ):
+        """A selected org's missing credential cannot pass using another org's data."""
+        selected_org = str(mock_authenticated_user.org_id)
+        user = dataclasses.replace(mock_authenticated_user, auth_method=auth_method)
+        app.dependency_overrides[authenticate_request] = lambda: user
+        calls: list[str] = []
+        scopes: list[str | None] = []
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            scopes.append(request.headers.get("X-Org-Id"))
+            scoped = request.headers.get("X-Org-Id") == selected_org
+            if request.url.path == "/api/v1/secrets/search":
+                present = credential_exists if scoped else not credential_exists
+                return httpx.Response(
+                    200, json={"items": [{"name": "TOKEN"}] if present else []}
+                )
+            if auth_method == AuthMethod.COOKIE:
+                assert "unrelated" not in request.headers["cookie"]
+                assert "keycloak_auth_1=second" in request.headers["cookie"]
+            if request.url.path == "/api/v1/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_settings": {
+                            "mcp_config": {
+                                "example": {"url": "https://mcp.example.test"}
+                            }
+                        }
+                    },
+                )
+            if request.url.path.endswith("/test"):
+                return httpx.Response(200, json={"ok": True})
+            if request.url.path.endswith("/repositories/search"):
+                return httpx.Response(
+                    200, json={"items": [{"full_name": "OpenHands/agent-server-gui"}]}
+                )
+            assert request.url.path.endswith("/branches/search")
+            return httpx.Response(
+                200, json={"items": [{"name": "main", "commit_sha": "a" * 40}]}
+            )
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            headers={
+                # API-key organization wins even when the request names another.
+                "X-Org-Id": (
+                    str(uuid.UUID(int=1))
+                    if auth_method == AuthMethod.API_KEY
+                    else selected_org
+                ),
+                "Cookie": (
+                    "keycloak_auth=first; keycloak_auth_1=second; unrelated=private"
+                ),
+            },
+            json=preflight(
+                CRON_DRAFT,
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example",
+                            transport="shttp",
+                            locator="https://mcp.example.test",
+                            secret_names=["TOKEN"],
+                        )
+                    ]
+                },
+            ),
+        )
+
+        assert response.status_code == 200
+        assert response.json()["valid"] is credential_exists
+        assert addressed_errors(response.json()) == (
+            [] if credential_exists else [(None, "credential_missing")]
+        )
+        assert set(scopes) == {selected_org}
+        assert "/api/v1/git/branches/search" in calls
+        assert ("/api/v1/settings/mcp/example/test" in calls) is credential_exists
+
+    @pytest.mark.parametrize("ref", ["a", "abcdef"])
+    async def test_short_hex_branch_name_is_not_a_commit_sha(self, async_client, ref):
+        """A missing branch cannot pass merely because a SHA starts with its name."""
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/repositories/search"):
+                return httpx.Response(
+                    200, json={"items": [{"full_name": "OpenHands/agent-server-gui"}]}
+                )
+            return httpx.Response(
+                200,
+                json={"items": [{"name": "main", "commit_sha": "abcdef" + "0" * 34}]},
+            )
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": [{**CRON_DRAFT["repos"][0], "ref": ref}]},
+                requirements={"integrations": []},
+            ),
+        )
+        assert response.status_code == 200
+        assert addressed_errors(response.json()) == [
+            ("repos[0].ref", "repository_ref_unverified")
+        ]
+
+    @pytest.mark.parametrize(
+        "locator",
+        [
+            "https://mcp.example.test:invalid",
+            "https://mcp.example.test:65536",
+            "https://mcp.example.test:0",
+        ],
+    )
+    async def test_invalid_mcp_port_is_rejected(self, async_client, locator):
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": None},
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example", transport="shttp", locator=locator
+                        )
+                    ]
+                },
+            ),
+        )
+        assert response.status_code == 422
+
+    async def test_mcp_query_does_not_match_another_tenant(self, async_client):
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_settings": {
+                            "mcp_config": {
+                                "example": {
+                                    "url": "https://mcp.example.test?tenant=other"
+                                }
+                            }
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": None},
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example",
+                            transport="shttp",
+                            locator="https://mcp.example.test?tenant=selected",
+                        )
+                    ]
+                },
+            ),
+        )
+        assert response.status_code == 200
+        assert addressed_errors(response.json()) == [
+            (None, "integration_not_configured")
+        ]
+
+    @pytest.mark.parametrize("failure", [False, True])
+    async def test_concurrent_checks_finish_in_field_order_and_drain_on_failure(
+        self, async_client, monkeypatch, failure
+    ):
+        """Probes overlap, keep field order, and never outlive the request."""
+        both_started = asyncio.Event()
+        started: set[str] = set()
+        finished: set[str] = set()
+        monkeypatch.setattr(capabilities_router, "_PREFLIGHT_TOTAL_TIMEOUT_SECONDS", 1)
+
+        async def outbound(request: httpx.Request) -> httpx.Response:
+            repository = request.url.params["query"]
+            started.add(repository)
+            if len(started) == 2:
+                both_started.set()
+            try:
+                await both_started.wait()
+                if failure:
+                    if repository == "owner/first":
+                        return httpx.Response(503, text="private-provider-detail")
+                    await asyncio.Event().wait()
+                return httpx.Response(200, json={"items": []})
+            finally:
+                finished.add(repository)
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {
+                    **CRON_DRAFT,
+                    "repos": [
+                        {"url": f"owner/{name}", "provider": "github"}
+                        for name in ("first", "second")
+                    ],
+                },
+                requirements={"integrations": []},
+            ),
+        )
+        assert started == finished == {"owner/first", "owner/second"}
+        if failure:
+            assert response.status_code == 503
+            assert "private-provider-detail" not in response.text
+        else:
+            assert response.status_code == 200
+            assert addressed_errors(response.json()) == [
+                (f"repos[{index}].url", "repository_not_accessible")
+                for index in range(2)
+            ]
+
+    @pytest.mark.parametrize("finish", ["success", "cancel", "timeout"])
+    async def test_probe_concurrency_is_bounded_and_cancellation_is_drained(
+        self, async_client, monkeypatch, finish
+    ):
+        """Queued probes stop after cancellation; the client stays usable."""
+        full = asyncio.Event()
+        release = asyncio.Event()
+        active = 0
+        peak = 0
+        started = 0
+        limit = capabilities_router._PREFLIGHT_CONCURRENCY
+        count = limit + 2
+        if finish == "timeout":
+            monkeypatch.setattr(
+                capabilities_router, "_PREFLIGHT_TOTAL_TIMEOUT_SECONDS", 0.2
+            )
+
+        async def outbound(request: httpx.Request) -> httpx.Response:
+            nonlocal active, peak, started
+            started += 1
+            active += 1
+            peak = max(peak, active)
+            if active == limit:
+                full.set()
+            try:
+                await release.wait()
+                return httpx.Response(200, json={"items": []})
+            finally:
+                active -= 1
+
+        await install_outbound_transport(outbound)
+        body = preflight(
+            {
+                **CRON_DRAFT,
+                "repos": [
+                    {"url": f"owner/repo-{index}", "provider": "github"}
+                    for index in range(count)
+                ],
+            },
+            requirements={"integrations": []},
+        )
+        task = asyncio.create_task(async_client.post(VALIDATE_URL, json=body))
+        try:
+            await asyncio.wait_for(full.wait(), timeout=2)
+            assert active == limit
+            assert started == limit
+            if finish == "cancel":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            elif finish == "timeout":
+                response = await asyncio.wait_for(task, timeout=2)
+                assert response.status_code == 503
+            else:
+                release.set()
+                response = await task
+                assert response.status_code == 200
+                assert len(response.json()["errors"]) == count
+            assert active == 0
+            assert peak == limit
+            if finish != "success":
+                assert started == limit
+        finally:
+            release.set()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        retry = await async_client.post(VALIDATE_URL, json=body)
+        assert retry.status_code == 200
+        assert len(retry.json()["errors"]) == count
+        assert active == 0
+
+    @pytest.mark.parametrize("with_requirements", [True, False])
+    async def test_repo_budget_is_field_addressable_and_preserves_legacy_clients(
+        self, async_client, with_requirements
+    ):
+        def outbound(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(
+                "An oversized preflight must not start dependency work"
+            )
+
+        await install_outbound_transport(outbound)
+        body = preflight(
+            {
+                **CRON_DRAFT,
+                "repos": [
+                    {"url": f"owner/repo-{index}", "provider": "github"}
+                    for index in range(
+                        capabilities_router._MAX_PREFLIGHT_REPOSITORIES + 1
+                    )
+                ],
+            }
+        )
+        if with_requirements:
+            body["requirements"] = {"integrations": []}
+        response = await async_client.post(VALIDATE_URL, json=body)
+        assert response.status_code == 200
+        assert addressed_errors(response.json()) == (
+            [("repos", "too_many_repositories")] if with_requirements else []
+        )
+
+    @pytest.mark.parametrize("pagination", ["match", "end", "repeat", "limit"])
+    async def test_secret_search_distinguishes_absence_from_incomplete_results(
+        self, async_client, pagination
+    ):
+        pages = 0
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            nonlocal pages
+            if request.url.path.endswith("/secrets/search"):
+                pages += 1
+                if pages == 2 and pagination in {"match", "end"}:
+                    return httpx.Response(
+                        200,
+                        json={
+                            "items": (
+                                [{"name": "TOKEN"}] if pagination == "match" else []
+                            )
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [{"name": "TOKEN_SUFFIX"}],
+                        "next_page_id": "same"
+                        if pagination == "repeat"
+                        else str(pages),
+                    },
+                )
+            if request.url.path == "/api/v1/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_settings": {
+                            "mcp_config": {
+                                "example": {"url": "https://mcp.example.test"}
+                            }
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"ok": True})
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": None},
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example",
+                            transport="shttp",
+                            locator="https://mcp.example.test",
+                            secret_names=["TOKEN"],
+                        )
+                    ]
+                },
+            ),
+        )
+        if pagination in {"repeat", "limit"}:
+            assert response.status_code == 503
+            assert pages == (
+                2
+                if pagination == "repeat"
+                else capabilities_router._MAX_PREFLIGHT_SEARCH_PAGES
+            )
+        else:
+            assert response.status_code == 200
+            assert response.json()["valid"] is (pagination == "match")
+            assert pages == 2
+
+    @pytest.mark.parametrize("available", [True, False])
+    async def test_integration_alternative_can_recover_from_partial_failure(
+        self, async_client, available
+    ):
+        """One broken stored connection must not mask a usable alternative."""
+        calls = []
+
+        def outbound(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v1/settings":
+                return httpx.Response(
+                    200,
+                    json={
+                        "agent_settings": {
+                            "mcp_config": {
+                                name: {"url": "https://mcp.example.test"}
+                                for name in ("broken", "working")
+                            }
+                        }
+                    },
+                )
+            calls.append(request.url.path)
+            if request.url.path.endswith("/broken/test"):
+                return httpx.Response(503, text="private-provider-error")
+            return httpx.Response(200, json={"ok": available})
+
+        await install_outbound_transport(outbound)
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(
+                {**CRON_DRAFT, "repos": None},
+                requirements={
+                    "integrations": [
+                        integration_requirement(
+                            "example",
+                            transport="shttp",
+                            locator="https://mcp.example.test",
+                        )
+                    ]
+                },
+            ),
+        )
+        assert response.status_code == (200 if available else 503)
+        if available:
+            assert response.json()["valid"] is True
+        assert len(calls) == 2
+        assert "private-provider-error" not in response.text
