@@ -33,6 +33,7 @@ from openhands.automation.middleware import (
     ApiKeyAwareCORSMiddleware,
     TelemetryContextMiddleware,
 )
+from openhands.automation.observability import init_observability
 from openhands.automation.preset_router import router as preset_router
 from openhands.automation.router import router
 from openhands.automation.scheduler import scheduler_loop
@@ -55,6 +56,7 @@ async def lifespan(app: FastAPI):
 
     # Apply the repo-wide JSON structured-logging convention
     setup_all_loggers()
+    init_observability()
 
     # Silence noisy third-party loggers
     for noisy_logger in (
@@ -264,7 +266,7 @@ def _create_app() -> FastAPI:
         description=(
             "Scheduled and event-driven automation execution for OpenHands Cloud"
         ),
-        version="1.15.2",  # x-release-please-version
+        version="1.19.0",  # x-release-please-version
         lifespan=lifespan,
         docs_url=f"{base_path}/docs",
         openapi_url=f"{base_path}/openapi.json",

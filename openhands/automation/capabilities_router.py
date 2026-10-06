@@ -65,7 +65,8 @@ from openhands.automation.schemas import (
 from openhands.automation.trigger_matcher import matches_trigger
 from openhands.automation.utils.cron import min_interval_seconds
 from openhands.automation.utils.model_profiles import (
-    validate_agent_profile_selection,
+    ensure_agent_profile_exists,
+    validate_agent_profile_combination,
     validate_model_profile_for_user,
 )
 from openhands.automation.utils.webhook import get_webhook_config
@@ -173,9 +174,11 @@ async def get_capabilities(
     builtin = builtin_sources() if config.service.webhook_secret else []
     event_sources = sorted({*builtin, *await _custom_sources(user.org_id, session)})
 
-    features = [*_STATIC_FEATURES]
-    if config.service.is_local_mode:
-        features.append("agentProfiles")
+    # Not a packaged-code feature: the id is passed through to the run, whose
+    # conversation server resolves it - the Agent Server locally, the OpenHands
+    # app server in cloud, which has to be a version that serves
+    # /api/agent-profiles.
+    features = [*_STATIC_FEATURES, "agentProfiles"]
     if event_sources:
         features.append("webhookDelivery")
     if config.kv.enabled:
@@ -223,8 +226,14 @@ async def validate_draft(
         "Validating draft for %s (automation_id=%s)", body.endpoint, body.automation_id
     )
 
+    # A saved draft has no agent profile, so the draft shape does not know the
+    # field. Creation does, and preflight answers for creation: the profile
+    # skips the shape and is checked by the model creation itself uses.
+    shape = {k: v for k, v in body.draft.items() if k != "agent_profile_id"}
     try:
-        normalized_draft = normalize_draft_body(body.endpoint, body.draft)
+        normalized_draft = normalize_draft_body(body.endpoint, shape)
+        if "agent_profile_id" in body.draft:
+            normalized_draft["agent_profile_id"] = body.draft["agent_profile_id"]
         draft = FINAL_DRAFT_MODELS[body.endpoint].model_validate(normalized_draft)
     except ValidationError as e:
         return ValidateDraftResponse(valid=False, errors=_schema_errors(e))
@@ -257,6 +266,16 @@ async def _validated_draft_response(
     client: httpx.AsyncClient,
 ) -> ValidateDraftResponse:
     """Collect draft errors; deployment checks are opt-in for legacy clients."""
+    # Check before touching the database, then report a rejected profile last.
+    profile_error: DraftValidationError | None = None
+    if isinstance(draft, CreateAutomationRequest):
+        try:
+            await ensure_agent_profile_exists(draft.agent_profile_id, request, user)
+        except HTTPException as e:
+            if e.status_code == 422:
+                profile_error = _agent_profile_error(e)
+            else:
+                raise _DependencyUnavailable from e
     errors: list[DraftValidationError] = []
     sample_event_matched: bool | None = None
 
@@ -273,15 +292,9 @@ async def _validated_draft_response(
 
     if isinstance(draft, CreateAutomationRequest):
         try:
-            validate_agent_profile_selection(draft.agent_profile_id, draft.model)
+            validate_agent_profile_combination(draft.agent_profile_id, draft.model)
         except HTTPException as e:
-            errors.append(
-                DraftValidationError(
-                    field="agent_profile_id",
-                    code="invalid_agent_profile",
-                    message=str(e.detail),
-                )
-            )
+            errors.append(_agent_profile_error(e))
 
     trigger = draft.trigger
     if isinstance(trigger, CronTrigger):
@@ -331,6 +344,9 @@ async def _validated_draft_response(
                 client=client,
             )
         )
+
+    if profile_error is not None:
+        errors.append(profile_error)
 
     # Complete every check before selecting the existing advisory response.
     # An unsupported ref must not mask a missing credential, a denied repo, or
@@ -1160,6 +1176,14 @@ async def _cloud_ref_errors(
             ),
         )
     ]
+
+
+def _agent_profile_error(error: HTTPException) -> DraftValidationError:
+    return DraftValidationError(
+        field="agent_profile_id",
+        code="invalid_agent_profile",
+        message=str(error.detail),
+    )
 
 
 async def _custom_sources(org_id: uuid.UUID, session: AsyncSession) -> list[str]:
