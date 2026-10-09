@@ -275,7 +275,17 @@ async def _validated_draft_response(
             if e.status_code == 422:
                 profile_error = _agent_profile_error(e)
             else:
-                raise _DependencyUnavailable from e
+                # Profile lookup is an existing advisory check.  Legacy
+                # clients do not opt into deployment preflight, so preserve
+                # the main-branch behavior and leave this profile unjudged.
+                # New clients request deployment requirements explicitly and
+                # need a fail-closed 503 when that dependency is unavailable.
+                if body.requirements is not None:
+                    raise _DependencyUnavailable from e
+                logger.warning(
+                    "Preflight could not check the agent profile (status=%s)",
+                    e.status_code,
+                )
     errors: list[DraftValidationError] = []
     sample_event_matched: bool | None = None
 

@@ -648,10 +648,31 @@ class TestValidateDraft:
         body = response.json()
         assert addressed_errors(body) == [("agent_profile_id", "invalid_agent_profile")]
 
-    async def test_profile_dependency_failure_is_not_reported_as_a_valid_draft(
+    async def test_opted_in_profile_dependency_failure_fails_closed(
         self, async_client, agent_profiles_api
     ):
-        """An OpenHands API failure cannot produce a passing preflight."""
+        """An opted-in deployment preflight fails closed on profile outage."""
+        agent_profiles_api.response = httpx.Response(500)
+        draft = {
+            **with_trigger(BUNDLE_DRAFT, schedule="*/10 * * * * *"),
+            "agent_profile_id": agent_profiles_api.profile_id,
+        }
+
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(draft, endpoint="/v1", requirements={"integrations": []}),
+            headers=agent_profiles_api.caller_auth,
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {
+            "detail": "Preflight validation is temporarily unavailable."
+        }
+
+    async def test_legacy_profile_dependency_failure_preserves_other_verdicts(
+        self, async_client, agent_profiles_api
+    ):
+        """Legacy clients keep the main-branch advisory profile behavior."""
         agent_profiles_api.response = httpx.Response(500)
         draft = {
             **with_trigger(BUNDLE_DRAFT, schedule="*/10 * * * * *"),
@@ -664,10 +685,40 @@ class TestValidateDraft:
             headers=agent_profiles_api.caller_auth,
         )
 
-        assert response.status_code == 503
-        assert response.json() == {
-            "detail": "Preflight validation is temporarily unavailable."
+        assert response.status_code == 200
+        assert addressed_errors(response.json()) == [
+            ("trigger.schedule", "interval_too_short")
+        ]
+
+    @pytest.mark.parametrize(
+        ("requirements", "expected_status"),
+        [(None, 200), ({"integrations": []}, 503)],
+    )
+    async def test_profile_request_timeout_respects_preflight_opt_in(
+        self, async_client, agent_profiles_api, requirements, expected_status
+    ):
+        """A profile transport timeout is advisory only for legacy clients."""
+        agent_profiles_api.raise_timeout = True
+        draft = {
+            **with_trigger(BUNDLE_DRAFT, schedule="*/10 * * * * *"),
+            "agent_profile_id": agent_profiles_api.profile_id,
         }
+
+        response = await async_client.post(
+            VALIDATE_URL,
+            json=preflight(draft, endpoint="/v1", requirements=requirements),
+            headers=agent_profiles_api.caller_auth,
+        )
+
+        assert response.status_code == expected_status
+        if requirements is None:
+            assert addressed_errors(response.json()) == [
+                ("trigger.schedule", "interval_too_short")
+            ]
+        else:
+            assert response.json() == {
+                "detail": "Preflight validation is temporarily unavailable."
+            }
 
     async def test_profile_lookup_obeys_the_total_preflight_timeout(
         self, async_client, monkeypatch
