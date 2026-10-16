@@ -7,6 +7,7 @@ import uuid
 
 import httpx
 import pytest
+from starlette.requests import Request
 
 from openhands.automation import capabilities_router
 from openhands.automation.app import app
@@ -113,6 +114,51 @@ def comment_event(body: str) -> dict:
 def addressed_errors(body: dict) -> list[tuple[str | None, str]]:
     """The field and code of every reported error, in order."""
     return [(error["field"], error["code"]) for error in body["errors"]]
+
+
+@pytest.mark.parametrize(
+    ("cookie", "expected_cookie"),
+    [
+        pytest.param(
+            "openhands_auth=oauth-session; keycloak_auth=legacy-session",
+            "openhands_auth=oauth-session",
+            id="preserve-preferred-oauth-cookie-name",
+        ),
+        pytest.param(
+            "keycloak_auth=first; keycloak_auth_1=second; unrelated=private",
+            "keycloak_auth=firstsecond",
+            id="reassemble-legacy-cookie-and-drop-unrelated-cookies",
+        ),
+    ],
+)
+async def test_cloud_preflight_outbound_request_preserves_session_cookie(
+    mock_authenticated_user, monkeypatch, cookie, expected_cookie
+):
+    """Cloud requests forward the selected cookie name and reassembled value."""
+    monkeypatch.setenv("AUTOMATION_AGENT_SERVER_URL", "")
+    monkeypatch.setenv("AUTOMATION_OPENHANDS_API_BASE_URL", "https://cloud.test")
+    clear_config_cache()
+    user = dataclasses.replace(mock_authenticated_user, auth_method=AuthMethod.COOKIE)
+    request = Request(
+        {"type": "http", "headers": [(b"cookie", cookie.encode("ascii"))]}
+    )
+    target = capabilities_router._preflight_target(request, user)
+    observed_cookies: list[str] = []
+
+    async def outbound(outbound_request: httpx.Request) -> httpx.Response:
+        observed_cookies.append(outbound_request.headers["cookie"])
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(outbound)) as client:
+        response = await capabilities_router._send_preflight_request(
+            client,
+            "GET",
+            f"{target.base_url}/api/v1/settings",
+            headers=target.headers,
+        )
+
+    assert response.status_code == 200
+    assert observed_cookies == [expected_cookie]
 
 
 @pytest.fixture(autouse=True)
@@ -1707,8 +1753,7 @@ class TestValidateDraft:
                     200, json={"items": [{"name": "TOKEN"}] if present else []}
                 )
             if auth_method == AuthMethod.COOKIE:
-                assert "unrelated" not in request.headers["cookie"]
-                assert "keycloak_auth_1=second" in request.headers["cookie"]
+                assert request.headers["cookie"] == "keycloak_auth=firstsecond"
             if request.url.path == "/api/v1/settings":
                 return httpx.Response(
                     200,

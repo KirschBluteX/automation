@@ -24,11 +24,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from openhands.automation.auth import (
-    MAX_SESSION_COOKIE_CHUNKS,
-    SESSION_COOKIE_NAME,
     X_ORG_ID_HEADER,
     AuthenticatedUser,
     AuthMethod,
+    _extract_session_cookie,
     get_http_client,
     require_permission,
 )
@@ -500,18 +499,11 @@ def _preflight_target(request: Request, user: AuthenticatedUser) -> _PreflightTa
             settings.openhands_api_base_url.rstrip("/"), headers, False
         )
     if user.auth_method == AuthMethod.COOKIE:
-        cookies: list[str] = []
-        for index in range(MAX_SESSION_COOKIE_CHUNKS):
-            name = (
-                SESSION_COOKIE_NAME if index == 0 else f"{SESSION_COOKIE_NAME}_{index}"
-            )
-            value = request.cookies.get(name)
-            if value is None:
-                break
-            cookies.append(f"{name}={value}")
-        if not cookies:
+        cookie = _extract_session_cookie(request)
+        if cookie is None:
             raise _DependencyUnavailable
-        headers["Cookie"] = "; ".join(cookies)
+        name, value = cookie
+        headers["Cookie"] = f"{name}={value}"
         return _PreflightTarget(
             settings.openhands_api_base_url.rstrip("/"), headers, False
         )
