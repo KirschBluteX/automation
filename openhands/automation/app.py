@@ -12,16 +12,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from openhands.automation.auth import create_http_client
-<<<<<<< HEAD
 from openhands.automation.capabilities_router import (
     router as capabilities_router,
     validate_draft,
 )
 from openhands.automation.config import ServiceSettings, get_config, get_settings
-=======
-from openhands.automation.capabilities_router import router as capabilities_router
-from openhands.automation.config import ServiceSettings, get_config, get_settings
->>>>>>> upstream/main
 from openhands.automation.db import (
     create_engine,
     create_session_factory,
